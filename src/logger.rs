@@ -1,61 +1,113 @@
-use std::{fs::{File, OpenOptions}, io::{Error, Write}, sync::Mutex};
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    sync::{Mutex, OnceLock},
+};
 
-use once_cell::sync::Lazy;
+use log::{Level, LevelFilter, Log, Metadata, Record};
 
-/// Yes yes, there is a log crate, why the DIY crap?
-/// Because the log crate more than doubles the final executable size for some logging
-/// that likely noone ever reads, that's why
+static INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+static FILE_LOGGER: FileLogger = FileLogger {
+    file: Mutex::new(None),
+};
 
-pub struct Logger {
-    file: Option<File>
+struct FileLogger {
+    file: Mutex<Option<File>>,
 }
 
-impl Logger {
-    pub fn set_file(self: & mut Logger, file_path: &str) {
-        self.file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(file_path)
-            .ok();
-    }
-
-    pub fn log(self: & mut Logger, level: &str, message: &str) -> Result<(), Error> {
-        match self.file.as_mut() {
-            Some(f) => f.write(format!("{}: {}\n", level, message).as_bytes()).and(Ok(())),
-            None => {
-                println!("{}: {}", level, message);
-                Ok(())
-            },
+impl Log for FileLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        if cfg!(debug_assertions) {
+            metadata.level() <= Level::Trace
+        } else {
+            metadata.level() <= Level::Info
         }
     }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let level = match record.level() {
+            Level::Trace => "trace",
+            Level::Debug => "debug",
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        };
+
+        let mut guard = self.file.lock().unwrap();
+        if let Some(file) = guard.as_mut() {
+            let _ = writeln!(file, "{}: {}", level, record.args());
+        } else {
+            eprintln!("{}: {}", level, record.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
 
+pub struct Logger;
 
-static LOGGER: Lazy<Mutex<Logger>> = Lazy::new(|| {
-    Mutex::new(Logger { file : None })
-});
+impl Logger {
+    pub fn init(file_path: &str) -> Result<(), String> {
+        let result = INIT_RESULT.get_or_init(|| {
+            let level = if cfg!(debug_assertions) { LevelFilter::Trace } else { LevelFilter::Info };
 
-pub fn set_file(file_path: &str) {
-    LOGGER.lock().unwrap().set_file(file_path);
-}
+            log::set_logger(&FILE_LOGGER)
+                .map(|()| log::set_max_level(level))
+                .map_err(|e| format!("Failed to initialize logger backend: {}", e))?;
 
-#[allow(dead_code)]
-pub fn debug<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("debug", message.as_ref()).ok();
-}
+            match OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(file_path)
+            {
+                Ok(file) => {
+                    let mut guard = FILE_LOGGER.file.lock().unwrap();
+                    *guard = Some(file);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warn: failed to open log file '{}': {}, falling back to stderr logger",
+                        file_path, e
+                    );
+                    Ok(())
+                }
+            }
+        });
 
-#[allow(dead_code)]
-pub fn info<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("info", message.as_ref()).ok();
-}
+        result.clone()
+    }
 
-#[allow(dead_code)]
-pub fn warn<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("warn", message.as_ref()).ok();
-}
+    #[cfg(debug_assertions)]
+    pub fn trace<S: AsRef<str>>(message: S) {
+        log::trace!("{}", message.as_ref());
+    }
 
-#[allow(dead_code)]
-pub fn error<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("error", message.as_ref()).ok();
+    #[cfg(not(debug_assertions))] // Disable trace logging in release builds
+    pub fn trace<S: AsRef<str>>(_message: S) {}
+
+    #[cfg(debug_assertions)]
+    pub fn debug<S: AsRef<str>>(message: S) {
+        log::debug!("{}", message.as_ref());
+    }
+
+    #[cfg(not(debug_assertions))] // Disable debug logging in release builds
+    pub fn debug<S: AsRef<str>>(_message: S) {}
+
+    pub fn info<S: AsRef<str>>(message: S) {
+        log::info!("{}", message.as_ref());
+    }
+
+    pub fn warn<S: AsRef<str>>(message: S) {
+        log::warn!("{}", message.as_ref());
+    }
+
+    pub fn error<S: AsRef<str>>(message: S) {
+        log::error!("{}", message.as_ref());
+    }
 }

@@ -1,5 +1,7 @@
 use std::{ffi::c_void, io::{Error, ErrorKind}, mem, path::Path};
 
+use crate::logger::Logger;
+
 use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
@@ -43,6 +45,8 @@ fn to_wide(input: &str) -> Vec<u16> {
 }
 
 pub fn parse_commandline(command_line: &str) -> Result<(String, Vec<String>), Error> {
+    Logger::trace(format!("parse_commandline input length={}", command_line.len()));
+    Logger::debug(format!("parsing command line: {}", command_line));
     let exe: String;
     let mut args: Vec<String> = vec![];
 
@@ -51,6 +55,7 @@ pub fn parse_commandline(command_line: &str) -> Result<(String, Vec<String>), Er
         let command_line_w = to_wide(command_line);
         let parsed = CommandLineToArgvW(PCWSTR(command_line_w.as_ptr()), &mut num_args);
         if parsed.is_null() {
+            Logger::error("CommandLineToArgvW failed");
             return Err(Error::last_os_error());
         }
 
@@ -61,10 +66,14 @@ pub fn parse_commandline(command_line: &str) -> Result<(String, Vec<String>), Er
         }
     }
 
+    Logger::trace(format!("CommandLineToArgvW parsed {} arg(s)", args.len() + 1));
+    Logger::debug(format!("parsed executable and {} argument(s)", args.len()));
+
     return Ok((exe, args))
 }
 
 pub fn get_protocol_handler(protocol: &str) -> Result<String, Error> {
+    Logger::debug(format!("querying protocol handler for '{}'", protocol));
     let result: String;
     unsafe {
         let mut hkey: HKEY = HKEY::default();
@@ -77,6 +86,7 @@ pub fn get_protocol_handler(protocol: &str) -> Result<String, Error> {
             &mut hkey,
         );
         if res.0 != 0 {
+            Logger::error(format!("RegOpenKeyExW failed: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
 
@@ -97,6 +107,7 @@ pub fn get_protocol_handler(protocol: &str) -> Result<String, Error> {
 
         // more data, buffer was too small
         if res == ERROR_MORE_DATA {
+            Logger::trace("registry value exceeded initial buffer, retrying with resized buffer");
             res = RegGetValueW(
                 hkey,
                 PCWSTR::null(),
@@ -111,6 +122,7 @@ pub fn get_protocol_handler(protocol: &str) -> Result<String, Error> {
         }
 
         if res.0 != 0 {
+            Logger::error(format!("RegGetValueW failed: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
 
@@ -119,14 +131,20 @@ pub fn get_protocol_handler(protocol: &str) -> Result<String, Error> {
         res = RegCloseKey(hkey);
 
         if res.0 != 0 {
+            Logger::warn(format!("RegCloseKey failed after read: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
     }
+
+    Logger::trace(format!("protocol handler command size={} chars", result.len()));
+    Logger::info(format!("resolved protocol handler for '{}'", protocol));
 
     Ok(result)
 }
 
 pub fn set_protocol_handler(protocol: &str, command: &str) -> Result<(), Error> {
+    Logger::trace(format!("set_protocol_handler command length={}", command.len()));
+    Logger::info(format!("setting protocol handler for '{}'", protocol));
     unsafe {
         let mut hkey: HKEY = HKEY::default();
         let sub_key = to_wide(format!(r"{0}\shell\open\command", protocol).as_str());
@@ -144,6 +162,7 @@ pub fn set_protocol_handler(protocol: &str, command: &str) -> Result<(), Error> 
         );
 
         if res.0 != 0 {
+            Logger::error(format!("RegCreateKeyExW failed: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
 
@@ -156,20 +175,29 @@ pub fn set_protocol_handler(protocol: &str, command: &str) -> Result<(), Error> 
         res = RegSetValueExW(hkey, PCWSTR::null(), Some(0), REG_SZ, Some(command_u8));
 
         if res.0 != 0 {
+            Logger::error(format!("RegSetValueExW failed: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
 
         res = RegCloseKey(hkey);
 
         if res.0 != 0 {
+            Logger::warn(format!("RegCloseKey failed after write: {}", res.0));
             return Err(Error::from_raw_os_error(res.0 as i32));
         }
     }
+
+    Logger::info(format!("protocol handler for '{}' updated", protocol));
 
     Ok(())
 }
 
 pub fn spawn_elevated(exe: &str, args: Vec<&str>) -> Result<(), Error> {
+    Logger::warn(format!(
+        "spawning elevated process '{}' with {} argument(s)",
+        exe,
+        args.len()
+    ));
     let cwd = Path::new(&exe).parent().unwrap().to_str().unwrap();
 
     let verb = to_wide("runas");
@@ -186,6 +214,13 @@ pub fn spawn_elevated(exe: &str, args: Vec<&str>) -> Result<(), Error> {
     exec_info.nShow = SW_SHOW.0;
 
     unsafe {
-        ShellExecuteExW(&mut exec_info).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+        ShellExecuteExW(&mut exec_info)
+            .map(|_| {
+                Logger::info("elevated process launched");
+            })
+            .map_err(|e| {
+                Logger::error(format!("failed to launch elevated process: {}", e));
+                Error::new(ErrorKind::Other, e.to_string())
+            })
     }
 }
