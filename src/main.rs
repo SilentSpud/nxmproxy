@@ -19,6 +19,12 @@ mod config_file;
 mod pipe;
 mod logger;
 
+/// NXM URLs longer than this are rejected to prevent DoS and injection probing.
+const MAX_URL_LEN: usize = 8192;
+/// Placeholder substituted into the manager command template before Win32 parsing,
+/// so that the URL is never part of the token structure seen by CommandLineToArgvW.
+const URL_PLACEHOLDER: &str = "__NXMPROXY_URL_PLACEHOLDER__";
+
 enum Options {
     Url {
         url: String,
@@ -89,6 +95,11 @@ fn parse_options() -> Result<Options, String> {
 }
 
 fn parse_nxm_game(url: &str) -> Result<&str, String> {
+    if url.len() > MAX_URL_LEN {
+        Logger::warn(format!("rejected overlong url (len={})", url.len()));
+        return Err("URL too long".to_string());
+    }
+
     let rest = url
         .strip_prefix("nxm://")
         .ok_or_else(|| {
@@ -107,6 +118,34 @@ fn parse_nxm_game(url: &str) -> Result<&str, String> {
     Ok(game)
 }
 
+fn sanitize_url_for_log(url: &str) -> &str {
+    // Log only up to the first query/fragment delimiter to avoid leaking tokens.
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    &url[..end]
+}
+
+/// Parse the manager command template, then substitute the URL into the already-parsed
+/// tokens so that URL content never influences command-line tokenization.
+fn build_manager_invocation(template: &str, url: &str) -> Result<(String, Vec<String>), String> {
+    let templated = if template.contains("%1") {
+        template.replace("%1", URL_PLACEHOLDER)
+    } else {
+        Logger::warn("manager command template has no %1 placeholder; url appended as argument");
+        format!("{} {}", template, URL_PLACEHOLDER)
+    };
+
+    let (exe, args) = parse_commandline(&templated)
+        .map_err(|e| format!("Failed to parse command line: {}", e))?;
+
+    let exe = exe.replace(URL_PLACEHOLDER, url);
+    let args = args
+        .into_iter()
+        .map(|a| a.replace(URL_PLACEHOLDER, url))
+        .collect();
+
+    Ok((exe, args))
+}
+
 /// handle download url with the appropriate manager
 fn download(config: &Config, url: &str) -> Result<(), String> {
     Logger::debug(format!("starting download workflow for url: {}", url));
@@ -119,8 +158,10 @@ fn download(config: &Config, url: &str) -> Result<(), String> {
             e
         })?;
 
-    Logger::info(format!("downloading url: {}, game: {}, manager: {}",
-        url, game, manager));
+    Logger::info(format!(
+        "downloading url: {}, game: {}, manager: {}",
+        sanitize_url_for_log(url), game, manager
+    ));
 
     if config.pipes.contains_key(&manager) {
         Logger::info(format!("trying pipe: {}", config.pipes[&manager]));
@@ -128,21 +169,19 @@ fn download(config: &Config, url: &str) -> Result<(), String> {
             Logger::info(format!("dispatched url to manager '{}' via pipe", manager));
             return Ok(());
         } else {
-            // this may not be a problem, the manager may just not be running yet
             Logger::warn("pipe write failed, falling back to process spawn");
         }
     }
 
-    let command_line = config.managers[&manager].to_string().replace("%1", url);
-    Logger::debug(format!("manager command line: {}", command_line));
-    let (exe, args) = parse_commandline(&command_line)
-        .map_err(|e| {
-            Logger::error(format!("failed to parse manager command line: {}", e));
-            format!("Failed to parse command line: {}", e)
-        })?;
+    let command_template = &config.managers[&manager];
+    Logger::debug("preparing manager invocation");
+    let (exe, args) = build_manager_invocation(command_template, url).map_err(|e| {
+        Logger::error(format!("failed to build manager invocation: {}", e));
+        e
+    })?;
 
     Logger::trace(format!("spawning manager exe '{}' with {} arg(s)", exe, args.len()));
-    Command::new(exe)
+    Command::new(&exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -191,8 +230,13 @@ fn test_installed() -> Result<bool, Error> {
         Ok(commandline) => {
             Logger::debug(format!("current nxm protocol handler command: {}", commandline));
             let (exe_path, _args) = parse_commandline(commandline.as_str())
-                .expect("Failed to parse command line");
-            let exe_name = Path::new(&exe_path).file_name().unwrap();
+                .map_err(|e| {
+                    Logger::error(format!("failed to parse handler command line: {}", e));
+                    e
+                })?;
+            let exe_name = Path::new(&exe_path)
+                .file_name()
+                .unwrap_or_default();
             Ok(exe_name == OsStr::new("nxmproxy.exe"))
         },
         Err(e) => {

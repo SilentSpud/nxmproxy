@@ -6,6 +6,9 @@ use std::{
 };
 
 use crate::logger::Logger;
+use crate::pipe::is_valid_pipe_name;
+
+const MAX_CONFIG_BYTES: u64 = 1 << 20; // 1 MiB
 
 #[derive(Debug)]
 pub struct Config {
@@ -177,7 +180,17 @@ impl Config {
     /// read config from disc
     pub fn read(config_path: &Path) -> Result<Config, Error> {
         Logger::debug(format!("reading config from {}", config_path.display()));
-        let config_data = match read_to_string(config_path.join("config.toml")) {
+        let config_path_file = config_path.join("config.toml");
+
+        // Guard against maliciously large config files before reading into memory.
+        if let Ok(meta) = std::fs::metadata(&config_path_file) {
+            if meta.len() > MAX_CONFIG_BYTES {
+                Logger::error(format!("config file exceeds size limit ({} bytes)", meta.len()));
+                return Err(Error::new(ErrorKind::InvalidData, "config file too large"));
+            }
+        }
+
+        let config_data = match read_to_string(&config_path_file) {
             Ok(s) => s,
             Err(e) => match e.kind() {
                 ErrorKind::NotFound => {
@@ -255,6 +268,11 @@ impl Config {
 
     /// register a named pipe to send urls to
     pub fn register_pipe(&mut self, manager: &str, pipe: &str) -> Result<(), String> {
+        if !is_valid_pipe_name(pipe) {
+            Logger::error(format!("invalid pipe name '{}'", pipe));
+            return Err("Pipe name may only contain A-Z, a-z, 0-9, '.', '_' or '-' and must be 1-128 characters".to_string());
+        }
+
         if !self.managers.contains_key(manager) {
             Logger::error(format!(
                 "cannot register pipe '{}' because manager '{}' does not exist",
